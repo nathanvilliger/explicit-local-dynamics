@@ -1,0 +1,302 @@
+/*
+Simulate the expansion of a colony where dispersal distances are randomly drawn from the discontinuous jump kernel- uniform probability out to the boundary distance between short-range and long-range, and then a power law decay according to r^-(mu+1) beyond that. Draw samples from the jump kernel using inverse transform sampling.
+
+These simulations were run using SLiM 3.6.
+*/
+
+function (void)write_spatial(void)
+{
+/*
+Record all individuals' spatial positions, distance from origin, birth generation, and total number within their interaction region.
+*/
+	head = c('x', 'y', 'radial distance', 'birth gen', 'mutation');
+	
+	// shift center of pop to (0,0)
+	xvals = p1.individuals.x - box_size / 2;
+	yvals = p1.individuals.y - box_size / 2;
+	radial_dist = sqrt(xvals^2 + yvals^2);
+	birth_gens = asFloat(sim.generation - p1.individuals.age);
+	muts = asFloat(p1.individuals.genome1.countOfMutationsOfType(m1)); // yes/no mutation? most relevant if using mutate_half and observing spatial patterns
+	data = cbind(xvals, yvals, radial_dist, birth_gens, muts);
+	to_record = rbind(head, asString(data));
+	writeFile('spatial.txt', to_record[, 0] + ',' + to_record[, 1] + ',' + to_record[, 2] + ',' + to_record[, 3] + ',' + to_record[, 4]);
+}
+
+function (float)jump_sampler(float kernel_exp, float p_loc, numeric r_int)
+{
+/*
+Use inverse transform sampling to draw dispersal distances from the discontinuous jump kernel. It has uniform probability within the interaction region, and then the power law tail ~ r^-(\mu+1) beyond. 
+Inputs: kernel exponent, which sets "heaviness" of power law tail
+		  probability of local dispersal (`local_prop` as defined in initialize() block)
+		  interaction distance, where jump kernel changes from uniform probability to power law tail
+*/
+	u = runif(1);
+	if (u <= p_loc) dist = u * (r_int / p_loc);
+	else dist = (((p_loc - 1) * r_int^kernel_exp) / (u - 1))^(1 / kernel_exp);
+	return dist;
+}
+
+initialize()
+{
+	if (exists('slimgui')) // set these variables from command line if not using GUI
+	{
+		defineConstant("mu", 1.5); // exponent for power law decay of jump kernel
+		defineConstant("local_percentage", 0); // percentage of dispersal attempts which are short-range
+		defineConstant("max_num", 10); // local carrying capacity - called `K` in the paper
+		defineConstant("cutoff", 1e6); // population cutoff - end sim once reached
+	}
+	initializeSLiMModelType("nonWF");
+	initializeSLiMOptions(dimensionality="xy", periodicity="xy");
+	
+	// set up the mutation type
+	initializeMutationType("m1", 0.5, "f", 0.0);
+	
+	// set up the genome: 1 base pair with no mutation or recombination 
+	initializeGenomicElementType("g1", m1, 1.0);
+	initializeGenomicElement(g1, 0, 0);
+	initializeMutationRate(0);
+	initializeRecombinationRate(0);
+	
+	// set up the density regulation scheme (max_num defined above or at CL)
+	defineConstant("r", 1); // max interaction distance/boundary radius between short- and long-range. called `r_b` in the paper
+	defineConstant("max_density", max_num / (PI * r^2)); // maximum density in indiv per area. called `\rho` in the paper
+	initializeInteractionType(1, "xy", reciprocal=T, maxDistance=r);
+	
+	// initial population, reproduction
+	defineConstant("N_0", max_num * 10); // initial population size
+	defineConstant("lambda", 1); // mean offspring production rate
+	
+	// probability of short-range dispersal (called `p` in the paper)
+	defineConstant("local_prop", local_percentage / 100);
+	
+	// spatial stuff 
+	defineConstant("box_size", 1e8); // side length of the simulation box
+	defineConstant("record_spatial", F); // x, y, age, etc.
+	
+	// IDEALLY SET FROM CL record entire local saturation process around a few initially isolated individuals?
+	if (!exists('record_logistic')) defineConstant("record_logistic", T); 
+	if (record_logistic) // record_logistic must be T in order to have any genetic diversity
+	{
+		defineConstant('mutate_half', F); // give same neutral mutation to half of initial population?
+		defineConstant('mutate_all', F); // or give everyone in the initial population a unique mutation? 
+		
+		// define an interaction type to find sufficiently isolated individuals
+		initializeInteractionType('i2', spatiality='xy', reciprocal=T, maxDistance=10 * r);
+		defineGlobal('lonelies', NULL);
+		
+		// for restarting sim with new seed if I never find enough sufficiently isolated individuals at the same time
+		if (!exists('min_satellites')) defineConstant("min_satellites", 1); // find at least this many isolated individuals **at the same time**. failed measurement if never find this many during simulation.
+		defineGlobal('num_failures', 0);
+		defineConstant('max_num_failures', 3); // give up after this many failures to find enough isolated individuals
+		defineConstant('simID', getSeed());
+	}
+		
+}
+
+reproduction()
+{
+	for (i in seqLen(rpois(1, lambda)))
+	{
+		// use cloning for reproduction
+		offspring = subpop.addCloned(individual);
+		
+		// Set offspring position. Later, in an early() event, kill the offspring who are placed too close to too many	others. This will regulate spatial population density.
+		// first, compute jump distance
+		jump = jump_sampler(mu, local_prop, r);
+		
+		// next, jump direction
+		theta = runif(1, min=0, max=2 * PI);
+		
+		// bring it all together to form jump vector
+		jump_vec = jump * c(cos(theta), sin(theta));
+		pos = individual.spatialPosition + jump_vec;
+		offspring.setSpatialPosition(p1.pointPeriodic(pos));
+	}
+	
+}
+
+1 early()
+{
+	if (exists('slimgui')) setwd('~/Desktop/');
+	else setwd(working_dir); // set from command line
+	
+	// Record simulation parameters here
+	parameters = sim.createLogFile('parameters.txt');
+	parameters.addCustomColumn('max_num', 'max_num;');
+	parameters.addCustomColumn('r', 'r;');
+	parameters.addCustomColumn('max_density', 'max_density;');
+	parameters.addCustomColumn('mu', 'mu;');
+	parameters.addCustomColumn('box size', 'box_size;');
+	parameters.addCustomColumn('percent_local', 'local_percentage;');
+	parameters.addCustomColumn('pop cutoff', 'cutoff;');
+	parameters.logRow();
+	
+	// Record population genetic data here
+	pop_data = sim.createLogFile('pop_data.txt', logInterval=1);
+	pop_data.addGeneration();
+	pop_data.addPopulationSize();
+	pop_data.addCustomColumn('ell', 'sqrt(p1.individualCount / (PI * max_density));'); // core radius estimate
+	defineGlobal('pop_het', 0); // reassigned every gen in late() event
+	pop_data.addCustomColumn('pop_heterozygosity', 'pop_het;'); // `H_G` in the paper
+		
+	// now begin the simulation
+	sim.addSubpop("p1", N_0);
+	p1.setSpatialBounds(c(0, 0, box_size, box_size)); 
+	p1.individuals.x = rnorm(n=p1.individualCount, mean=box_size/2, sd=2*r);
+	p1.individuals.y = rnorm(n=p1.individualCount, mean=box_size/2, sd=2*r);
+}
+
+1 late()
+{
+	if (record_logistic)
+	{	
+		// give a mutation to half the population if desired
+		if (mutate_half)
+		{
+			suppressWarnings(T);
+			mut = p1.individuals[0].genome1.addNewDrawnMutation(m1, 0);
+			sample(p1.individuals.genome1, asInteger(p1.individualCount / 2)).addMutations(mut);
+			suppressWarnings(F);
+			defineGlobal('mut', mut);
+		}
+		
+		// or give a mutation to everyone in the population (different mutation object to each ind, but same mutation type)
+		if (mutate_all)
+		{
+			suppressWarnings(T);
+			for (ind in p1.individuals)
+			{
+				ind.genome1.addNewDrawnMutation(m1, 0);
+			}
+			suppressWarnings(F);
+		}
+		// record sim state so I can restart with new seed in case of unsuccessful satellite measurement
+		sim.outputFull('slim_' + simID + '.txt');
+	}
+}
+
+early()
+{
+	i1.evaluate(p1);
+	
+	//	select all of the recently born (in the current generation) individuals
+	youngsters = p1.individuals[p1.individuals.age == 0];
+	
+	// kill them if they are too close to too many others	
+	neighbor_count = i1.interactingNeighborCount(youngsters); // how many within interaction region (not counting focal individual)?	
+	crowded = neighbor_count >= max_num; // True if too many within interaction region
+	youngsters[crowded].fitnessScaling = 0;
+	
+}
+
+late()
+{		
+	// SLiM's calcHeterozygosity() function only works correctly when there's one or zero mutations. account for that. Define population heterozygosity globally so it can be logged in pop_data.
+	if (length(sim.mutations) <= 1) defineGlobal('pop_het', calcHeterozygosity(p1.individuals.genome1));
+	else defineGlobal('pop_het', 1 - sum(p1.individuals.genome1.mutationFrequenciesInGenomes()^2));
+		
+	
+	// for recording local saturation and heterozygosity around initially isolated individuals
+	if (record_logistic)
+	{		
+		i1.evaluate(p1);
+		if (isNULL(lonelies)) // haven't yet found the isolated individuals to track
+		{
+			i2.evaluate(p1);
+			
+			// which individuals are in unoccupied terrain?
+			lonely_inds = which(i2.interactingNeighborCount(p1.individuals) == 0);
+			
+			// if I've found enough lonely individuals to track:
+			if (length(lonely_inds) >= min_satellites)
+			{
+				counts = i1.interactingNeighborCount(p1.individuals[lonely_inds]) + 1; // +1 because they don't see themselves
+				writeFile('counts.txt', paste(counts));
+				defineGlobal('lonelies', lonely_inds);
+				
+				// record local heterozygosities around isolated inds if I gave all initial inds a unique mutation
+				if (mutate_all)
+				{
+					hets = rep(0.0, count=length(lonely_inds));
+					for (i in seqLen(length(lonely_inds)))
+					{
+						ind = p1.individuals[lonely_inds[i]];
+						inds = c(ind, i1.nearestInteractingNeighbors(ind, count=2*max_num));
+						freqs = inds.genome1.mutationFrequenciesInGenomes();
+						hets[i] = 1 - sum(freqs^2);
+					}
+					writeFile('hets.txt', paste(hets));
+				}
+			}
+		}
+		else // already found the set of initially isolated individuals
+		{
+			counts = i1.interactingNeighborCount(p1.individuals[lonelies]) + 1; // +1 because they don't see themselves
+			writeFile('counts.txt', paste(counts), append=T);
+			
+			if (mutate_all)
+			{
+				hets = rep(0.0, count=length(lonelies));
+				for (i in seqLen(length(lonelies)))
+				{
+					ind = p1.individuals[lonelies[i]];
+					inds = c(ind, i1.nearestInteractingNeighbors(ind, count=2*max_num));
+					freqs = inds.genome1.mutationFrequenciesInGenomes();
+					hets[i] = 1 - sum(freqs^2);
+				}
+				writeFile('hets.txt', paste(hets), append=T);
+			}
+		}
+	}
+	
+}
+
+1: late()
+{
+	if (p1.individualCount > cutoff)
+	{
+		if (record_spatial) write_spatial();
+		
+		if (!exists('slimgui'))
+			cat(asString(local_percentage) + ' percent local mu = ' + asString(mu) + ' run ' + iter + '/' + maxiter + ': ');
+		catn('Reached ' + p1.individualCount + ' individuals -- simulation terminated');
+		
+		if (record_logistic)
+		{
+			if (isNULL(lonelies)) // never found enough isolated individuals to track
+			{
+				defineGlobal('num_failures', num_failures + 1);
+				if (num_failures == max_num_failures)
+				{
+					catn('TOO MANY FAILURES -- GIVING UP');
+					sim.simulationFinished();
+				}			
+				else
+				{
+					catn('Unsuccessful saturation recording. Restarting from end of gen 1.');
+					
+					// go back to generation 1 and start a newly seeded run
+					suppressWarnings(T);
+					sim.readFromPopulationFile('slim_' + simID + '.txt');
+					suppressWarnings(F);
+					p1.setSpatialBounds(c(0, 0, box_size, box_size)); // wasn't written to the file
+					setSeed(rdunif(1, 0, asInteger(2^62) - 1));
+				}
+			}
+			else // successful measurement
+			{
+				sim.simulationFinished();
+			}
+		}
+		else
+		{
+			sim.simulationFinished();
+		}
+	}
+}
+
+10000
+{
+	catn('PROBLEM -- SIM RAN WAY TOO LONG');
+	sim.simulationFinished();
+}
